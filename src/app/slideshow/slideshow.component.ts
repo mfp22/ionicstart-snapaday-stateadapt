@@ -83,10 +83,6 @@ export class SlideshowComponent {
   photosInput$ = new BehaviorSubject<Photo[]>([]);
   photosReceived$ = this.photosInput$.pipe(toSource('photosReceived$'));
 
-  photoAdapter = createAdapter<Photo | null>()({
-    setNull: () => null,
-  });
-
   slideshowAdapter = joinAdapters<{
     currentPhotos: Photo[];
     currentPhoto: Photo | null;
@@ -96,7 +92,7 @@ export class SlideshowComponent {
   }>()({
     // Define adapters that will manage each property
     currentPhotos: createAdapter<Photo[]>()({}),
-    currentPhoto: this.photoAdapter,
+    currentPhoto: createAdapter<Photo | null>()({}),
     paused: booleanAdapter,
     loop: booleanAdapter,
     delayTime: numberAdapter,
