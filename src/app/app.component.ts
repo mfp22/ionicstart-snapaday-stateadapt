@@ -14,6 +14,7 @@ import * as CordovaSQLiteDriver from 'localforage-cordovasqlitedriver';
 
 import { ChangeDetectionStrategy, Component, OnInit } from '@angular/core';
 import { PhotoService } from './home/data-access/photo/photo.service';
+import { defaultStoreProvider } from '@state-adapt/angular';
 
 @Component({
   selector: 'app-root',
@@ -62,7 +63,10 @@ export class AppComponent implements OnInit {
       { preloadingStrategy: PreloadAllModules }
     ),
   ],
-  providers: [{ provide: RouteReuseStrategy, useClass: IonicRouteStrategy }],
+  providers: [
+    { provide: RouteReuseStrategy, useClass: IonicRouteStrategy },
+    defaultStoreProvider,
+  ],
   bootstrap: [AppComponent],
 })
 export class AppModule {}
