@@ -11,17 +11,12 @@ import {
   RangeCustomEvent,
   ToggleCustomEvent,
 } from '@ionic/angular';
-import {
-  BehaviorSubject,
-  combineLatest,
-  EMPTY,
-  from,
-  iif,
-  NEVER,
-  of,
-  timer,
-} from 'rxjs';
-import { concatMap, delayWhen, expand, switchMap } from 'rxjs/operators';
+import { adapt, watch } from '@state-adapt/angular';
+import { createAdapter, joinAdapters, mapPayloads } from '@state-adapt/core';
+import { booleanAdapter, numberAdapter } from '@state-adapt/core/adapters';
+import { toSource } from '@state-adapt/rxjs';
+import { BehaviorSubject, interval, NEVER } from 'rxjs';
+import { switchMap } from 'rxjs/operators';
 import { Photo } from '../shared/interfaces/photo';
 import { SlideshowImageComponentModule } from './ui/slideshow-image.component';
 
@@ -30,7 +25,7 @@ import { SlideshowImageComponentModule } from './ui/slideshow-image.component';
   template: `
     <ion-header>
       <ion-toolbar
-        *ngIf="{ paused: paused$ | async } as pause"
+        *ngIf="{ paused: slideshow.paused$ | async } as pause"
         [color]="pause.paused ? 'success' : 'danger'"
       >
         <ion-title>{{
@@ -47,27 +42,28 @@ import { SlideshowImageComponentModule } from './ui/slideshow-image.component';
       </ion-toolbar>
     </ion-header>
     <ion-content>
-      <ng-container *ngIf="currentPhoto$ | async as photo">
+      <ng-container *ngIf="slideshow.currentPhoto$ | async as photo">
+        <!-- Each event in template calls only 1 function with minimal data -->
         <app-slideshow-image
-          (mousedown)="paused$.next(true)"
-          (mouseup)="paused$.next(false); staticPhoto$.next(null)"
+          (mousedown)="slideshow.setPausedTrue()"
+          (mouseup)="slideshow.setPausedFalse()"
           [safeResourceUrl]="photo.safeResourceUrl"
         ></app-slideshow-image>
         <ion-card>
           <ion-card-content>
-            <ion-button (click)="prevPhoto(photo)">Prev</ion-button>
-            <ion-button (click)="nextPhoto(photo)">Next</ion-button>
+            <ion-button (click)="slideshow.move(-1)">Prev</ion-button>
+            <ion-button (click)="slideshow.move(1)">Next</ion-button>
             <h2>Speed</h2>
             <ion-range
-              (ionChange)="changeDelay($event)"
+              (ionChange)="slideshow.setDelayTime($event)"
               min="50"
               max="1000"
-              [value]="delayTime$.value"
+              [value]="slideshow.delayTime$ | async"
             ></ion-range>
             <h2>Loop</h2>
             <ion-toggle
-              [checked]="loop$.value"
-              (ionChange)="toggleLoop($event)"
+              [checked]="slideshow.loop$ | async"
+              (ionChange)="slideshow.toggleLoop($event)"
             ></ion-toggle>
           </ion-card-content>
         </ion-card>
@@ -84,81 +80,84 @@ import { SlideshowImageComponentModule } from './ui/slideshow-image.component';
   changeDetection: ChangeDetectionStrategy.OnPush,
 })
 export class SlideshowComponent {
-  currentPhotos$ = new BehaviorSubject<Photo[]>([]);
+  photosInput$ = new BehaviorSubject<Photo[]>([]);
+  photosReceived$ = this.photosInput$.pipe(toSource('photosReceived$'));
 
-  paused$ = new BehaviorSubject(false); // pause/play slideshow
-  delayTime$ = new BehaviorSubject(1000); // time between photos
-  loop$ = new BehaviorSubject(true); // loop slideshow
-  staticPhoto$ = new BehaviorSubject<Photo | null>(null); // set photo manually
+  photoAdapter = createAdapter<Photo | null>()({
+    setNull: () => null,
+  });
 
-  // If stream is paused delay is infinite, otherwise it is the value of delayTime$
-  calculateDelay$ = combineLatest([this.paused$, this.delayTime$]).pipe(
-    switchMap(([isPaused, delayTime]) =>
-      iif(() => isPaused, NEVER, timer(delayTime))
-    )
+  slideshowAdapter = joinAdapters<{
+    currentPhotos: Photo[];
+    currentPhoto: Photo | null;
+    paused: boolean;
+    loop: boolean;
+    delayTime: number;
+  }>()({
+    // Define adapters that will manage each property
+    currentPhotos: createAdapter<Photo[]>()({}),
+    currentPhoto: this.photoAdapter,
+    paused: booleanAdapter,
+    loop: booleanAdapter,
+    delayTime: numberAdapter,
+  })({
+    // Objects define new memoized selectors
+    currentIndex: (s) => s.currentPhotos.indexOf(s.currentPhoto as Photo),
+    photoCount: (s) => s.currentPhotos.length,
+  })({
+    isLastPhoto: (s) => s.currentIndex === s.photoCount - 1,
+  })({
+    tickDelay: (s) =>
+      s.paused || (!s.loop && s.isLastPhoto) ? Infinity : s.delayTime,
+  })(([selectors]) => ({
+    // Functions define new reactions
+    move: (state, amount: number) => {
+      const photoCount = selectors.photoCount(state);
+      const newIndex =
+        (selectors.currentIndex(state) + amount + photoCount) % photoCount;
+      return {
+        ...state,
+        paused: true,
+        currentPhoto: state.currentPhotos[newIndex],
+      };
+    },
+  }))(([, reactions]) => ({
+    nextWithoutPause: (state) => ({
+      ...reactions.move(state, 1),
+      paused: false,
+    }),
+    // Changes existing state reactions to accept different payloads
+    ...mapPayloads(reactions, {
+      setDelayTime: (ev: Event) =>
+        (ev as RangeCustomEvent).detail.value as number,
+      toggleLoop: (ev: Event) => (ev as ToggleCustomEvent).detail.checked,
+    }),
+  }))();
+
+  initialState = {
+    currentPhotos: [] as Photo[],
+    loop: true,
+    delayTime: 1000,
+    paused: false,
+    currentPhoto: null as Photo | null,
+  };
+
+  // `watch` is for circular RxJS references. Path must be same as store path.
+  tick$ = watch('slideshow', this.slideshowAdapter).tickDelay$.pipe(
+    switchMap((t) => (t === Infinity ? NEVER : interval(t))),
+    toSource('tick$')
   );
 
-  // Emit one photo at a time with a delay
-  playCurrentPhotos$ = this.currentPhotos$.pipe(
-    switchMap((photos) => from(photos)),
-    concatMap((photo) => of(photo).pipe(delayWhen(() => this.calculateDelay$)))
-  );
-
-  currentPhoto$ = combineLatest([this.currentPhotos$, this.staticPhoto$]).pipe(
-    switchMap(([_, staticPhoto]) =>
-      iif(
-        // Determine whether to show static photo or slideshow
-        () => staticPhoto !== null,
-        of(staticPhoto),
-        this.playCurrentPhotos$.pipe(
-          // Play recursively when last photo is reached if loop is set to true
-          expand((photo) => {
-            const currentPhotos = this.currentPhotos$.value;
-            const isLastPhoto =
-              photo === currentPhotos[currentPhotos.length - 1];
-            return isLastPhoto && this.loop$.value
-              ? this.playCurrentPhotos$
-              : EMPTY;
-          })
-        )
-      )
-    )
-  );
+  // Initializes state, subscribes to sources
+  slideshow = adapt(['slideshow', this.initialState, this.slideshowAdapter], {
+    nextWithoutPause: this.tick$,
+    setCurrentPhotos: this.photosReceived$,
+  });
 
   constructor(protected modalCtrl: ModalController) {}
 
   @Input() set photos(value: Photo[]) {
-    this.currentPhotos$.next([...value].reverse());
-  }
-
-  nextPhoto(currentPhoto: Photo) {
-    this.paused$.next(true);
-
-    const currentPhotos = this.currentPhotos$.value;
-    const currentIndex = currentPhotos.indexOf(currentPhoto);
-    const nextIndex =
-      currentIndex < currentPhotos.length - 1 ? currentIndex + 1 : 0;
-
-    this.staticPhoto$.next(currentPhotos[nextIndex]);
-  }
-
-  prevPhoto(currentPhoto: Photo) {
-    this.paused$.next(true);
-
-    const currentPhotos = this.currentPhotos$.value;
-    const currentIndex = currentPhotos.indexOf(currentPhoto);
-    const prevIndex =
-      currentIndex > 0 ? currentIndex - 1 : currentPhotos.length - 1;
-
-    this.staticPhoto$.next(currentPhotos[prevIndex]);
-  }
-
-  changeDelay(ev: Event) {
-    this.delayTime$.next((ev as RangeCustomEvent).detail.value as number);
-  }
-
-  toggleLoop(ev: Event) {
-    this.loop$.next((ev as ToggleCustomEvent).detail.checked);
+    this.photosInput$.next([...value].reverse());
   }
 }
 
